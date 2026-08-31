@@ -4,4 +4,4 @@ dist
 .env.*.local
 .DS_Store
 *.log
-.workbuddy/tmp-*.txt
+.workbuddy/
