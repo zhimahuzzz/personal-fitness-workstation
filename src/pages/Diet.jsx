@@ -2,6 +2,7 @@ import React, { useEffect, useState, useMemo, useCallback, useRef } from 'react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../context/AuthContext'
 import { parseMealText, makeItem, sumItems } from '../lib/foodParser'
+import { aiEstimateMealText, aiRecognizeMealPhoto } from '../lib/ai'
 
 const MEAL_TYPES = [
   { id: 'breakfast', label: '早餐' },
@@ -35,13 +36,13 @@ const loadPhotoMap = () => {
 const savePhotoMap = map => {
   try { localStorage.setItem(PHOTO_KEY, JSON.stringify(map)) } catch { /* 存储满则忽略 */ }
 }
-// 压缩图片为小尺寸 dataURL，避免占满 localStorage
+// 压缩图片为小尺寸 dataURL，避免占满 localStorage（720px 兼顾本地存储体积与 AI 识别效果）
 function compressImage(file, cb) {
   const reader = new FileReader()
   reader.onload = () => {
     const img = new Image()
     img.onload = () => {
-      const max = 480
+      const max = 720
       const scale = Math.min(1, max / Math.max(img.width, img.height))
       const canvas = document.createElement('canvas')
       canvas.width = Math.round(img.width * scale)
@@ -224,13 +225,50 @@ function AddMealSheet({ foods, defaultType, onClose, onSave }) {
   const [unmatched, setUnmatched] = useState([])
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
+  const [aiBusy, setAiBusy] = useState(false)
 
-  const doParse = () => {
+  // 估算热量：食物库优先，库里没有的部分交给 AI 兜底估算
+  const doParse = async () => {
+    if (!note.trim()) { setErr('请先写吃了什么，如「鸡蛋2个 牛奶一杯 宫保鸡丁一份」'); return }
     setErr('')
-    const { items, unmatched } = parseMealText(note, foods)
-    setItems(items)
-    setUnmatched(unmatched)
-    if (!items.length) setErr('没有识别到食物。试试「鸡蛋2个 牛奶一杯 米饭一碗」这样写，或先点击下方设置体重。')
+    const { items: libItems, unmatched: left } = parseMealText(note, foods)
+    setItems(libItems)
+    setUnmatched([])
+    if (!left.length) {
+      if (!libItems.length) setErr('没有识别到食物，试试「鸡蛋2个 牛奶一杯」这样写')
+      return
+    }
+    setAiBusy(true)
+    try {
+      const aiItems = await aiEstimateMealText(left.join('，'))
+      setItems([...libItems, ...aiItems])
+      if (!aiItems.length) setUnmatched(left)
+    } catch (e) {
+      setUnmatched(left)
+      setErr('AI 估算失败：' + (e.message || '请稍后再试') + '（未识别部分暂未计入热量）')
+    } finally {
+      setAiBusy(false)
+    }
+  }
+
+  // AI 识别餐食照片
+  const doPhotoAI = async () => {
+    if (!photo) return
+    setAiBusy(true)
+    setErr('')
+    try {
+      const aiItems = await aiRecognizeMealPhoto(photo)
+      if (!aiItems.length) {
+        setErr('AI 没有从照片里识别出食物，可以补一句文字描述再点「估算热量」')
+      } else {
+        setItems(aiItems)
+        setUnmatched([])
+      }
+    } catch (e) {
+      setErr('照片识别失败：' + (e.message || '请稍后再试'))
+    } finally {
+      setAiBusy(false)
+    }
   }
 
   const setGrams = (i, grams) => setItems(prev => {
@@ -277,12 +315,15 @@ function AddMealSheet({ foods, defaultType, onClose, onSave }) {
         </div>
 
         <div className="field">
-          <label>拍照（可选，仅本设备临时保存，不上传云端）</label>
-          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+          <label>拍照（可选，仅本设备临时保存，不上传云端；点「识别照片」让 AI 帮你算）</label>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
             <button className="btn btn-ghost btn-sm" style={{ width: 'auto', padding: '8px 14px' }} onClick={() => fileRef.current?.click()}>📷 拍照/选图</button>
             {photo && (
               <>
                 <img src={photo} alt="预览" style={{ width: 56, height: 56, objectFit: 'cover', borderRadius: 8 }} />
+                <button className="btn btn-ghost btn-sm" style={{ width: 'auto', padding: '8px 14px' }} disabled={aiBusy} onClick={doPhotoAI}>
+                  {aiBusy ? '🤖 识别中…' : '🤖 识别照片'}
+                </button>
                 <button className="link-btn danger" onClick={() => setPhoto('')}>移除</button>
               </>
             )}
@@ -291,7 +332,7 @@ function AddMealSheet({ foods, defaultType, onClose, onSave }) {
             onChange={e => { const f = e.target.files?.[0]; if (f) compressImage(f, setPhoto) }} />
         </div>
 
-        <button className="btn btn-ghost" onClick={doParse}>⚡ 估算热量</button>
+        <button className="btn btn-ghost" disabled={aiBusy} onClick={doParse}>{aiBusy ? '⚡ AI 估算中…' : '⚡ 估算热量（食物库 + AI）'}</button>
 
         {items.length > 0 && (
           <div style={{ marginTop: 12 }}>
@@ -311,7 +352,7 @@ function AddMealSheet({ foods, defaultType, onClose, onSave }) {
         )}
 
         {unmatched.length > 0 && (
-          <div className="hint" style={{ marginTop: 8 }}>未识别：{unmatched.join('、')}（食物库暂无，其热量未计入）</div>
+          <div className="hint" style={{ marginTop: 8 }}>未识别：{unmatched.join('、')}（AI 也没认出来，热量未计入，可换个说法或拆开写）</div>
         )}
 
         {err && <div className="banner banner-error" style={{ marginTop: 10 }}>{err}</div>}
