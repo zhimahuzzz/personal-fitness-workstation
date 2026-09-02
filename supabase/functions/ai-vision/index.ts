@@ -4,12 +4,14 @@
 //
 // 为什么需要这个中转：应用部署在 GitHub Pages（纯静态），AI 的 key 不能放前端（公开网页会被扒走盗刷），
 // 所以前端只调用自己的 Supabase，由这个函数拿着密钥去调智谱 API。
-
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+// 注意：零外部依赖（esm.sh 导入会导致 BOOT_ERROR），登录验证直接走 Supabase Auth REST 接口。
 
 const ZHIPU_API = "https://open.bigmodel.cn/api/paas/v4/chat/completions";
-const VISION_MODEL = "glm-4.6v-flash"; // 视觉理解（免费）
-const TEXT_MODEL = "glm-4.7-flash"; // 文本（免费）
+// 免费模型链：首选限流（429）时自动降级到备用模型
+const MODEL_CHAINS = {
+  vision: ["glm-4.6v-flash", "glm-4v-flash"],
+  text: ["glm-4.7-flash", "glm-4-flash"],
+};
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -39,20 +41,37 @@ function extractJson(text: string): unknown {
   throw new Error("AI 返回格式异常，请重试");
 }
 
-async function zhipu(body: Record<string, unknown>): Promise<string> {
+async function zhipu(
+  kind: "vision" | "text",
+  payload: Record<string, unknown>,
+): Promise<string> {
   const key = Deno.env.get("ZHIPU_API_KEY");
   if (!key) throw new Error("未配置 ZHIPU_API_KEY 密钥（Supabase → Edge Functions → Secrets）");
-  const resp = await fetch(ZHIPU_API, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!resp.ok) {
-    const t = await resp.text();
-    throw new Error(`智谱 API ${resp.status}：${t.slice(0, 200)}`);
+  let lastErr = "";
+  for (const model of MODEL_CHAINS[kind]) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const resp = await fetch(ZHIPU_API, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ model, temperature: 0.2, ...payload }),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        const content = data?.choices?.[0]?.message?.content ?? "";
+        if (String(content).trim()) return content;
+        lastErr = `模型 ${model} 返回空内容`;
+        break; // 空内容不重试，直接换下一个模型
+      }
+      const t = await resp.text();
+      lastErr = `智谱 API ${resp.status}（${model}）：${t.slice(0, 150)}`;
+      if (resp.status === 429) {
+        await new Promise((r) => setTimeout(r, 1500)); // 瞬时限流，等一下重试
+        continue;
+      }
+      break; // 403 无权限等其他错误，换下一个模型
+    }
   }
-  const data = await resp.json();
-  return data?.choices?.[0]?.message?.content ?? "";
+  throw new Error(lastErr || "AI 服务暂时不可用，请稍后再试");
 }
 
 // 清洗食物明细，防止脏数据进库
@@ -78,13 +97,15 @@ Deno.serve(async (req) => {
 
   try {
     // 验证调用者是已登录用户（supabase.functions.invoke 会自动带上 JWT）
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_ANON_KEY")!,
-    );
+    // 直接调 Auth REST 接口，不引入 supabase-js 依赖
     const authHeader = req.headers.get("Authorization") || "";
-    const { data: { user } } = await supabase.auth.getUser(authHeader);
-    if (!user) return json({ error: "未登录或登录已过期" }, 401);
+    const authResp = await fetch(`${Deno.env.get("SUPABASE_URL")}/auth/v1/user`, {
+      headers: {
+        Authorization: authHeader,
+        apikey: Deno.env.get("SUPABASE_ANON_KEY")!,
+      },
+    });
+    if (!authResp.ok) return json({ error: "未登录或登录已过期" }, 401);
 
     const { task, text, image } = await req.json();
 
@@ -94,9 +115,7 @@ Deno.serve(async (req) => {
       if (!desc.trim()) return json({ items: [] });
       const content =
         `你是专业营养师，熟悉中国常见食物、家常菜和外卖菜品。根据下面的描述估算每种食物的份量（克）与营养。${MEAL_SCHEMA}\n描述：${desc}`;
-      const out = await zhipu({
-        model: TEXT_MODEL,
-        temperature: 0.2,
+      const out = await zhipu("text", {
         messages: [{ role: "user", content }],
       });
       return json({ items: normItems(extractJson(out)) });
@@ -112,9 +131,7 @@ Deno.serve(async (req) => {
         },
         { type: "image_url", image_url: { url: image } },
       ];
-      const out = await zhipu({
-        model: VISION_MODEL,
-        temperature: 0.2,
+      const out = await zhipu("vision", {
         messages: [{ role: "user", content }],
       });
       return json({ items: normItems(extractJson(out)) });
@@ -130,9 +147,7 @@ Deno.serve(async (req) => {
         },
         { type: "image_url", image_url: { url: image } },
       ];
-      const out = await zhipu({
-        model: VISION_MODEL,
-        temperature: 0.2,
+      const out = await zhipu("vision", {
         messages: [{ role: "user", content }],
       });
       const r = extractJson(out) as any;
