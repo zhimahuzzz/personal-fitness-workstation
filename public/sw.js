@@ -4,7 +4,7 @@
 // 注意：所有路径用相对写法（'./xxx'），会基于 sw.js 所在目录解析，
 // 这样本地开发（/）和 GitHub Pages（/personal-fitness-workstation/）都能正确工作
 
-const CACHE_NAME = 'fwd-v2'
+const CACHE_NAME = 'fwd-v3'
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './apple-touch-icon.png']
 
 self.addEventListener('install', e => {
