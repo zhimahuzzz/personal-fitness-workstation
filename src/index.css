@@ -147,6 +147,7 @@ body {
 }
 .banner-warn { background: var(--accent-soft); color: var(--accent); }
 .banner-error { background: var(--danger-soft); color: var(--danger); }
+.banner-ai { background: rgba(15, 110, 86, 0.08); color: var(--primary); }
 
 .auth-wrap {
   min-height: 100%;
