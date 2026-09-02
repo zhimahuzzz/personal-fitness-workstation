@@ -2,6 +2,7 @@ import React, { useEffect, useState, useMemo, useCallback, useRef } from 'react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../context/AuthContext'
 import TrendChart from '../components/TrendChart'
+import { aiEstimateBodyFat } from '../lib/ai'
 
 const pad = n => String(n).padStart(2, '0')
 const todayStr = () => {
@@ -29,6 +30,14 @@ function compressToBlob(file, cb) {
   reader.readAsDataURL(file)
 }
 
+// Blob 转 dataURL（发给 AI 识别用）
+const blobToDataUrl = blob => new Promise((resolve, reject) => {
+  const r = new FileReader()
+  r.onload = () => resolve(r.result)
+  r.onerror = reject
+  r.readAsDataURL(blob)
+})
+
 export default function BodyStatus() {
   const { user } = useAuth()
   const [metrics, setMetrics] = useState([])
@@ -38,6 +47,7 @@ export default function BodyStatus() {
   const [recordOpen, setRecordOpen] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [pageErr, setPageErr] = useState('')
+  const [aiFatMsg, setAiFatMsg] = useState('') // AI 估体脂的结果提示
   const fileRef = useRef(null)
 
   const loadAll = useCallback(async () => {
@@ -100,6 +110,7 @@ export default function BodyStatus() {
     if (!file) return
     setUploading(true)
     setPageErr('')
+    setAiFatMsg('')
     compressToBlob(file, async blob => {
       try {
         if (!blob) throw new Error('图片处理失败，请换一张试试')
@@ -109,8 +120,29 @@ export default function BodyStatus() {
         const { error: insErr } = await supabase.from('progress_photos').insert({ user_id: user.id, taken_date: todayStr(), storage_path: path })
         if (insErr) throw insErr
         await loadAll()
+        // 照片保存成功后，AI 估算体脂（失败不影响照片，只是不填数）
+        setUploading(false)
+        setAiFatMsg('🤖 AI 正在估算体脂率…')
+        try {
+          const dataUrl = await blobToDataUrl(blob)
+          const { body_fat_pct, confidence } = await aiEstimateBodyFat(dataUrl)
+          if (body_fat_pct) {
+            // 只更新当天的体脂率，不动体重等已有数据
+            const { error: fatErr } = await supabase
+              .from('body_metrics')
+              .upsert({ user_id: user.id, measured_date: todayStr(), body_fat_pct }, { onConflict: 'user_id,measured_date' })
+            if (fatErr) throw fatErr
+            setAiFatMsg(`🤖 AI 估算体脂率约 ${body_fat_pct}%${confidence ? `（可信度：${confidence}）` : ''}，已填入今天记录，可点「记录今天」调整`)
+            await loadAll()
+          } else {
+            setAiFatMsg('🤖 这张照片不太适合估体脂（需要全身或大半身照），可重拍一张或手动填写')
+          }
+        } catch (e) {
+          setAiFatMsg('🤖 体脂估算失败：' + (e.message || '请稍后再试') + '。照片已保存，可手动填写体脂')
+        }
       } catch (err) {
         setPageErr('照片上传失败：' + (err.message || '未知错误'))
+        setAiFatMsg('')
       } finally {
         setUploading(false)
       }
@@ -128,9 +160,10 @@ export default function BodyStatus() {
   const todayMetric = metrics.find(m => m.measured_date === today)
 
   return (
-    <div className="app-shell">
+      <div className="app-shell">
       <div className="page-title">状态</div>
       {pageErr && <div className="banner banner-error">{pageErr}</div>}
+      {aiFatMsg && <div className="banner banner-ai">{aiFatMsg}</div>}
 
       <div className="card">
         <div className="card-title">
