@@ -193,6 +193,7 @@ body {
 .pr-line { font-size: 12px; color: var(--text-2); background: var(--surface-2); border-radius: 8px; padding: 6px 10px; margin-bottom: 10px; }
 
 .set-row { display: grid; grid-template-columns: 30px 1fr 1fr 32px; gap: 8px; align-items: center; margin-bottom: 8px; }
+.set-row.cols3 { grid-template-columns: 30px 1fr 32px; }
 .set-row input {
   padding: 10px 6px; border: 1px solid #D8E0DB; border-radius: var(--radius-sm);
   font-size: 16px; text-align: center; width: 100%; background: var(--surface);
