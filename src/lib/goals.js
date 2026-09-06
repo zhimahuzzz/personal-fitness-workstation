@@ -49,3 +49,16 @@ export function goalProgress({ start, current, target }) {
     : `${verb} ${gained.toFixed(1)} / ${need.toFixed(1)} kg，还差 ${left.toFixed(1)} kg`
   return { pct, text }
 }
+
+/**
+ * 估算一次力量训练的净消耗（大卡）
+ * 模型：力量训练 MET≈6，扣除静息 1，净 MET=5；时长未填时按「每组约 2.5 分钟（含组间休息）」估算
+ * @param {{setCount:number, durationMin?:number|null, weightKg:number|null}} p
+ * @returns {number}
+ */
+export function estimateWorkoutKcal({ setCount, durationMin, weightKg }) {
+  const w = Number(weightKg)
+  if (!w || w <= 0 || !(Number(setCount) > 0)) return 0
+  const mins = Number(durationMin) > 0 ? Number(durationMin) : Number(setCount) * 2.5
+  return Math.round(5 * w * (mins / 60))
+}
