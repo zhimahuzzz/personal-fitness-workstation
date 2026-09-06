@@ -50,28 +50,35 @@ async function zhipu(
   let lastErr = "";
   for (const model of MODEL_CHAINS[kind]) {
     for (let attempt = 0; attempt < 2; attempt++) {
-      const resp = await fetch(ZHIPU_API, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model, temperature: 0.2, ...payload }),
-      });
-      if (resp.ok) {
-        const data = await resp.json();
-        const content = data?.choices?.[0]?.message?.content ?? "";
-        if (String(content).trim()) return content;
-        lastErr = `模型 ${model} 返回空内容`;
-        break; // 空内容不重试，直接换下一个模型
+      try {
+        const resp = await fetch(ZHIPU_API, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ model, temperature: 0.2, ...payload }),
+          signal: AbortSignal.timeout(30000), // 单次最多30秒，防止高峰期连接挂起拖死函数
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          const content = data?.choices?.[0]?.message?.content ?? "";
+          if (String(content).trim()) return content;
+          lastErr = `模型 ${model} 返回空内容`;
+          break; // 空内容不重试，直接换下一个模型
+        }
+        const t = await resp.text();
+        lastErr = `智谱 API ${resp.status}（${model}）：${t.slice(0, 150)}`;
+        if (resp.status === 429) {
+          await new Promise((r) => setTimeout(r, 1500)); // 瞬时限流，等一下重试
+          continue;
+        }
+        break; // 403 无权限等其他错误，换下一个模型
+      } catch (e) {
+        // 网络错误/超时：换下一个模型（不在此模型上重试）
+        lastErr = `调用 ${model} 失败：${(e as Error)?.message || "网络超时"}`;
+        break;
       }
-      const t = await resp.text();
-      lastErr = `智谱 API ${resp.status}（${model}）：${t.slice(0, 150)}`;
-      if (resp.status === 429) {
-        await new Promise((r) => setTimeout(r, 1500)); // 瞬时限流，等一下重试
-        continue;
-      }
-      break; // 403 无权限等其他错误，换下一个模型
     }
   }
-  throw new Error(lastErr || "AI 服务暂时不可用，请稍后再试");
+  throw new Error(lastErr || "AI 服务暂时不可用（高峰期限流），请稍后再试");
 }
 
 // 清洗食物明细，防止脏数据进库
@@ -107,7 +114,7 @@ Deno.serve(async (req) => {
     });
     if (!authResp.ok) return json({ error: "未登录或登录已过期" }, 401);
 
-    const { task, text, image } = await req.json();
+    const { task, text, image, ...payload } = await req.json();
 
     // 1) 文字估算：食物库没匹配到的部分发给 AI 兜底
     if (task === "meal_text") {
@@ -156,6 +163,31 @@ Deno.serve(async (req) => {
         body_fat_pct: pct > 3 && pct < 70 ? Math.round(pct * 10) / 10 : null,
         confidence: String(r?.confidence || ""),
       });
+    }
+
+    // 4) 训练消耗估算：按动作明细算 kcal（净值）
+    if (task === "workout_kcal") {
+      const weightKg = Number(payload?.weightKg) || 0;
+      const durationMin = Number(payload?.durationMin) || 0;
+      const items = Array.isArray(payload?.items) ? payload.items.slice(0, 40) : [];
+      if (!items.length) return json({ error: "缺少训练明细" }, 400);
+      const lines = items.map((it: any) => {
+        const sets = Array.isArray(it?.sets) ? it.sets : [];
+        const detail = sets
+          .map((s: any) => (Number(s?.durationSec) > 0 ? `${s.durationSec}秒` : `${s?.reps || 0}次${Number(s?.weight) > 0 ? `×${s.weight}kg` : ""}`))
+          .join("、");
+        return `- ${it?.name || "?"}：${sets.length}组（${detail}）`;
+      }).join("\n");
+      const content =
+        `你是专业体能教练。根据训练明细估算这次训练的净热量消耗（kcal，运动消耗减去安静代谢的净值）。` +
+        `体重${weightKg ? `${weightKg}kg` : "未知（按70kg估）"}，时长${durationMin ? `${durationMin}分钟` : "未知（按组数估）"}。\n${lines}\n` +
+        `严格只输出 JSON：{"kcal": 数字, "note": "一句话说明"}，不要任何其他文字。`;
+      const out = await zhipu("text", {
+        messages: [{ role: "user", content }],
+      });
+      const r = extractJson(out) as any;
+      const kcal = Math.round(Number(r?.kcal));
+      return json({ kcal: kcal > 0 && kcal < 3000 ? kcal : null, note: String(r?.note || "").slice(0, 60) });
     }
 
     return json({ error: "未知任务类型" }, 400);
