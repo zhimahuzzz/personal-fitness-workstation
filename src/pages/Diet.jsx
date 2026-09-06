@@ -3,6 +3,8 @@ import { supabase } from '../lib/supabase'
 import { useAuth } from '../context/AuthContext'
 import { parseMealText, makeItem, sumItems } from '../lib/foodParser'
 import { aiEstimateMealText, aiRecognizeMealPhoto } from '../lib/ai'
+import { computeTargets } from '../lib/goals'
+import { workoutBurn } from '../lib/dailyBalance'
 
 const MEAL_TYPES = [
   { id: 'breakfast', label: '早餐' },
@@ -79,14 +81,38 @@ export default function Diet() {
     setPhotos(loadPhotoMap())
   }, [user]) // eslint-disable-line
 
+  // 当日训练数据（用于「剩余额度」计算，跟随日期切换）
+  useEffect(() => {
+    if (!supabase || !user) return
+    let cancelled = false
+    supabase.from('workouts').select('id, duration_min, est_kcal').eq('workout_date', date)
+      .then(async ({ data: dw }) => {
+        if (cancelled) return
+        setDayWorkouts(dw || [])
+        if (dw?.length) {
+          const { data: ds } = await supabase.from('workout_sets').select('workout_id').in('workout_id', dw.map(w => w.id))
+          if (cancelled) return
+          const cnt = {}
+          for (const s of (ds || [])) cnt[s.workout_id] = (cnt[s.workout_id] || 0) + 1
+          setDaySetCount(cnt)
+        } else {
+          setDaySetCount({})
+        }
+      })
+    return () => { cancelled = true }
+  }, [user, date])
+
   const totals = useMemo(() => sumItems(meals.flatMap(m => m.items || [])), [meals])
 
-  // 增肌目标：热量 = 体重×33×1.1（小盈余），蛋白质 = 体重×1.8g
-  const targets = useMemo(() => {
-    const w = profile?.weight_kg ? Number(profile.weight_kg) : null
-    if (!w) return null
-    return { kcal: Math.round(w * 33 * 1.1), protein: Math.round(w * 1.8) }
-  }, [profile])
+  // 增肌目标（与仪表盘一致：体重×33×活动系数×1.1；蛋白质 1.8g/kg）
+  const targets = useMemo(() => computeTargets(profile), [profile])
+
+  // 当日训练消耗（AI 估算优先，公式兜底）
+  const [dayWorkouts, setDayWorkouts] = useState([])
+  const [daySetCount, setDaySetCount] = useState({})
+  const dayBurn = useMemo(() => dayWorkouts.reduce(
+    (s, w) => s + workoutBurn(w, daySetCount[w.id] || 0, profile?.weight_kg).kcal, 0
+  ), [dayWorkouts, daySetCount, profile])
 
   const deleteMeal = async id => {
     if (!window.confirm('删除这条饮食记录？')) return
@@ -116,19 +142,20 @@ export default function Diet() {
       {/* 今日汇总 */}
       <div className="card">
         <div className="card-title">
-          <span>今日摄入</span>
+          <span>{isToday ? '今日摄入' : `${date.slice(5)} 摄入`}</span>
           {targets ? (
-            <span className="muted">{Math.round(totals.kcal)} / {targets.kcal} kcal</span>
+            <span className="muted">{Math.round(totals.kcal)} / {targets.kcal + dayBurn} kcal</span>
           ) : (
             <button className="link-btn" onClick={() => setProfileOpen(true)}>设置体重看目标 ›</button>
           )}
         </div>
         {targets && (
           <>
-            <div className="pbar"><i style={{ width: `${Math.min(100, totals.kcal / targets.kcal * 100)}%`, background: totals.kcal > targets.kcal * 1.15 ? 'var(--accent)' : 'var(--primary)' }} /></div>
+            <div className="pbar"><i style={{ width: `${Math.min(100, totals.kcal / (targets.kcal + dayBurn) * 100)}%`, background: totals.kcal > (targets.kcal + dayBurn) * 1.15 ? 'var(--accent)' : 'var(--primary)' }} /></div>
             <div className="macro-row">
               <div className="macro">
                 <span>蛋白质 {Math.round(totals.p)}g / {targets.protein}g</span>
+
                 <div className="pbar pbar-sm"><i style={{ width: `${Math.min(100, totals.p / targets.protein * 100)}%` }} /></div>
               </div>
               <div className="macro">
@@ -136,6 +163,16 @@ export default function Diet() {
               </div>
             </div>
           </>
+        )}
+        {targets && (
+          <div className="hint" style={{ marginTop: 8 }}>
+            {(() => {
+              const left = targets.kcal + dayBurn - Math.round(totals.kcal)
+              return dayBurn > 0
+                ? `目标 ${targets.kcal} + 训练消耗 ${dayBurn} kcal，${left >= 0 ? `今天还能吃 ≈ ${left} kcal` : `已超出 ≈ ${-left} kcal`}`
+                : `目标 ${targets.kcal} kcal（今天还没训练，练完会解锁更多额度）`
+            })()}
+          </div>
         )}
         {!targets && <div className="hint">记录体重后，这里会显示增肌目标（热量小盈余 + 蛋白质 1.8g/kg）的每日进度。</div>}
       </div>
