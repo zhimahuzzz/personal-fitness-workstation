@@ -43,3 +43,8 @@ export const aiRecognizeMealPhoto = async image => {
 
 // 全身照估体脂：返回 { body_fat_pct, confidence }
 export const aiEstimateBodyFat = image => invoke('body_fat', { image })
+
+// 训练消耗估算（按动作明细）：返回 { kcal, note }
+// items: [{ name, sets: [{ reps, weight, durationSec }] }]
+export const aiEstimateWorkoutKcal = ({ weightKg, durationMin, items }) =>
+  invoke('workout_kcal', { weightKg, durationMin, items })
