@@ -6,12 +6,20 @@ const pad = n => String(n).padStart(2, '0')
 const fmt = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
 const dayLabel = ds => { const d = new Date(ds + 'T00:00:00'); return `周${'日一二三四五六'[d.getDay()]}` }
 
-export function buildWeeklyReport({ profile = {}, workouts = [], sets = [], meals = [], metrics = [] }) {
+export function buildWeeklyReport({ profile = {}, workouts = [], sets = [], meals = [], metrics = [], exercises = [] }) {
   const today = new Date()
   const weekStart = new Date(today)
   weekStart.setDate(weekStart.getDate() - 6)
   const ws = fmt(weekStart)
   const we = fmt(today)
+
+  const exMap = new Map(exercises.map(e => [e.id, e]))
+  const setLabel = s => {
+    const cat = exMap.get(s.exercise_id)?.category || 'weight'
+    if (cat === 'timed') return `${s.duration_sec || 0}秒`
+    if (cat === 'reps') return `${s.reps}次`
+    return `${s.reps}次×${Number(s.weight)}kg`
+  }
 
   // 训练：按训练日聚合
   const setsByW = new Map()
@@ -24,7 +32,8 @@ export function buildWeeklyReport({ profile = {}, workouts = [], sets = [], meal
     if (!workoutsByDate.has(w.workout_date)) workoutsByDate.set(w.workout_date, [])
     workoutsByDate.get(w.workout_date).push(w)
   }
-  const weekVolume = sets.reduce((sum, s) => sum + Number(s.reps || 0) * Number(s.weight || 0), 0)
+  const isWeightSet = s => (exMap.get(s.exercise_id)?.category || 'weight') === 'weight'
+  const weekVolume = sets.filter(isWeightSet).reduce((sum, s) => sum + Number(s.reps || 0) * Number(s.weight || 0), 0)
   const weekDays = workoutsByDate.size
 
   // 饮食：按日聚合
@@ -54,6 +63,17 @@ export function buildWeeklyReport({ profile = {}, workouts = [], sets = [], meal
   const kcalTarget = tdee ? Math.round(tdee * 1.1 / 10) * 10 : null
   const proteinTarget = profile.weight_kg ? Math.round(profile.weight_kg * 1.8) : null
 
+  // 训练消耗估算（AI 估算值优先，无则净MET=5，时长缺省按每组2.5分钟）
+  const estKcal = w => {
+    if (Number(w.est_kcal) > 0) return Math.round(Number(w.est_kcal))
+    const n = (setsByW.get(w.id) || []).length
+    if (!n || !profile.weight_kg) return 0
+    const mins = Number(w.duration_min) > 0 ? Number(w.duration_min) : n * 2.5
+    return Math.round(5 * Number(profile.weight_kg) * (mins / 60))
+  }
+  const weekKcal = workouts.reduce((s, w) => s + estKcal(w), 0)
+  const aiKcalDays = workouts.filter(w => Number(w.est_kcal) > 0).length
+
   const lines = []
   lines.push(`# 老张健身工作台 · 周报（${ws} ~ ${we}）`)
   lines.push('')
@@ -71,11 +91,13 @@ export function buildWeeklyReport({ profile = {}, workouts = [], sets = [], meal
     lines.push('- 本周无训练记录')
   } else {
     lines.push(`- 训练场次：${workouts.length}（共 ${weekDays} 个不同日期）${profile.weekly_days ? `，计划 ${profile.weekly_days} 天，达成 ${weekDays >= profile.weekly_days ? '✅' : '⏳'}` : ''}`)
-    lines.push(`- 总训练容量：${weekVolume.toLocaleString()} kg`)
+    lines.push(`- 总训练容量：${weekVolume.toLocaleString()} kg（仅重量型动作）`)
+    lines.push(`- 本周训练估算消耗：约 ${weekKcal} kcal${aiKcalDays ? `（其中 ${aiKcalDays} 天为 AI 按动作明细估算）` : ''}`)
     lines.push('- 训练明细：')
     const sorted = [...workouts].sort((a, b) => a.workout_date.localeCompare(b.workout_date))
     for (const w of sorted) {
-      lines.push(`  - ${w.workout_date} ${dayLabel(w.workout_date)}：${w.title || '（无标题）'}`)
+      const wKcal = estKcal(w)
+      lines.push(`  - ${w.workout_date} ${dayLabel(w.workout_date)}：${w.title || '（无标题）'}${wKcal ? `，约 ${wKcal} kcal` : ''}`)
       const wSets = setsByW.get(w.id) || []
       if (wSets.length) {
         const byEx = new Map()
@@ -86,8 +108,8 @@ export function buildWeeklyReport({ profile = {}, workouts = [], sets = [], meal
         for (const [eid, list] of byEx) {
           const detail = list
             .sort((a, b) => a.set_index - b.set_index)
-            .map(s => `${s.reps}×${s.weight}kg`).join('，')
-          lines.push(`    - 动作 #${String(eid).slice(0, 6)}：${detail}`)
+            .map(setLabel).join('，')
+          lines.push(`    - ${exMap.get(eid)?.name || `动作#${String(eid).slice(0, 6)}`}：${detail}`)
         }
       }
     }
@@ -109,6 +131,28 @@ export function buildWeeklyReport({ profile = {}, workouts = [], sets = [], meal
       const agg = mealsByDate.get(ds)
       if (agg) lines.push(`  - ${ds} ${dayLabel(ds)}：${Math.round(agg.kcal)} kcal / 蛋白 ${Math.round(agg.protein)} g（${agg.count} 餐）`)
     }
+  }
+  lines.push('')
+
+  // 每日热量缺口（仅统计有饮食记录的日子）
+  if (kcalTarget && meals.length > 0) {
+    lines.push('')
+    lines.push('## 每日热量缺口')
+    lines.push(`- 缺口 = 摄入 −（目标 ${kcalTarget} + 当日训练消耗）；正值盈余/负值缺口`)
+    let sumGap = 0, gapDays = 0
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(weekStart)
+      d.setDate(d.getDate() + i)
+      const ds = fmt(d)
+      const agg = mealsByDate.get(ds)
+      if (!agg || agg.kcal <= 0) continue
+      const dayBurn = (workoutsByDate.get(ds) || []).reduce((s, w) => s + estKcal(w), 0)
+      const g = Math.round(agg.kcal - (kcalTarget + dayBurn))
+      sumGap += g
+      gapDays += 1
+      lines.push(`  - ${ds} ${dayLabel(ds)}：摄入 ${Math.round(agg.kcal)} − 目标 ${kcalTarget}${dayBurn ? ` − 训练 ${dayBurn}` : ''} = ${g >= 0 ? `盈余 ${g}` : `缺口 ${g}`} kcal`)
+    }
+    if (gapDays) lines.push(`- 合计（${gapDays} 个记录日）：${sumGap >= 0 ? `盈余 ${Math.round(sumGap)}` : `缺口 ${Math.round(-sumGap)}`} kcal，日均 ${sumGap >= 0 ? '盈余' : '缺口'} ${Math.abs(Math.round(sumGap / gapDays))} kcal`)
   }
   lines.push('')
 
